@@ -12,7 +12,7 @@ project(
 set(Boost_USE_STATIC_LIBS OFF)
 set(Boost_USE_MULTITHREADED ON)
 set(Boost_USE_STATIC_RUNTIME OFF)
-find_package(Boost 1.77 REQUIRED COMPONENTS)
+find_package(Boost 1.77)
 message(STATUS "Boost version: ${Boost_VERSION}")
 
 add_subdirectory(src)
