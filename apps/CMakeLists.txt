@@ -1,0 +1,3 @@
+add_executable(lobby_server lobby_server.cpp)
+
+target_link_libraries(lobby_server PRIVATE lobby_lib)
