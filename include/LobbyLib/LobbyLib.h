@@ -17,7 +17,7 @@ struct Player;
 enum EventType {
     Connected, ConnectError, 
     Accepted, AcceptError, 
-    ServerDisconnected, PlayerDisconnected, 
+    ClientDisconnected, PlayerDisconnected, 
     ClientReadError, PlayerReadError,
     ClientWriteError, PlayerWriteError
 };
@@ -58,7 +58,7 @@ struct AcceptErrorEvent : public Event {
 };
 
 struct ClientDisconnectedEvent : public Event {
-    ClientDisconnectedEvent() : Event(ServerDisconnected) {}
+    ClientDisconnectedEvent() : Event(ClientDisconnected) {}
     LobbyClient* client;
 };
 
@@ -131,14 +131,16 @@ Event* getNextEvent(LobbyLibLoop* loop);
 
 /**
  * Create a new lobby client attached to the given loop.
- * The client must be deleted with deleteLobbyClient() once it is done being used
+ * The client must be deleted with deleteClient() once it is done being used
  */
 LobbyClient* createLobbyClient(LobbyLibLoop* loop);
 
 /**
- * Delete a lobby client and close any associated network connections
+ * Delete a lobby client. Warning!! Ensure that the client is not connected
+ * before calling this function. Calling this function on an active client
+ * will cause undefined behavior!
  */
-void deleteLobbyClient(LobbyClient* client);
+void deleteClient(LobbyClient* client);
 
 /**
  * Connect a client to the specified host with the given hostname and port number
@@ -148,7 +150,7 @@ void connectToServer(LobbyClient* client, std::string host, std::string port);
 /**
  * Disconnect from any active network communications
  */
-void disconnectFromServer(LobbyClient* client);
+void disconnectClient(LobbyClient* client);
 
 // Set username
 void setUsername(LobbyClient* client, std::string username);

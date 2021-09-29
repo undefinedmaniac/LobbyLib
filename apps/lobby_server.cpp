@@ -10,14 +10,20 @@ int main()
 {
     LL::LoopPtr loop(LL::createLoop(), LL::deleteLoop);
     LL::ServerPtr server(LL::createLobbyServer(loop.get()), LL::deleteLobbyServer);
-    LL::ClientPtr client(LL::createLobbyClient(loop.get()), LL::deleteLobbyClient);
+    LL::ClientPtr client(LL::createLobbyClient(loop.get()), LL::deleteClient);
 
     LL::startListening(server.get(), "54621");
     LL::connectToServer(client.get(), "127.0.0.1", "54621");
 
-    for (int i = 0; i < 30; i++)
+    for (int i = 0; i < 300; i++)
     {
-        std::cout << i << std::endl;
+        if (i % 10 == 0) {
+            std::cout << i << std::endl;
+        }
+
+        if (i > 150) {
+            server.reset();
+        }
 
         LL::processEvents(loop.get());
         while (LL::hasEvents(loop.get())) {
@@ -36,12 +42,12 @@ int main()
                 std::cout << "IP: " << acceptedEvent->ip << "   Port: " << acceptedEvent->port << std::endl;
             } else if (event->type == LL::EventType::PlayerDisconnected) {
                 std::cout << "Player disconnected!" << std::endl;
-            } else if (event->type == LL::EventType::ServerDisconnected) {
-                std::cout << "Server disconnected!" << std::endl;
+            } else if (event->type == LL::EventType::ClientDisconnected) {
+                std::cout << "Client disconnected!" << std::endl;
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     return 0;

@@ -20,10 +20,10 @@ using namespace std::placeholders;
 namespace LL
 {
 
-const short HEADER_SIZE = 2;
-const short INACTIVITY_TIMEOUT = 1;
-const short REPLY_TIMEOUT = 1;
-const short KEEP_ALIVE_TRIES = 3;
+const unsigned short HEADER_SIZE = 2;
+const unsigned short INACTIVITY_TIMEOUT = 5000;
+const unsigned short REPLY_TIMEOUT = 1000;
+const unsigned short KEEP_ALIVE_TRIES = 3;
 
 struct SocketData;
 
@@ -85,7 +85,7 @@ struct LobbyClient
     unique_ptr<tcp::socket> socket;
     SocketData socketData;
 
-    short keepAliveTimeout = INACTIVITY_TIMEOUT + REPLY_TIMEOUT*KEEP_ALIVE_TRIES;
+    unsigned short keepAliveTimeout = INACTIVITY_TIMEOUT + REPLY_TIMEOUT * KEEP_ALIVE_TRIES;
     unique_ptr<asio::steady_timer> keepAliveTimer;
 };
 
@@ -99,13 +99,14 @@ struct Lobby
 {
 
 };
-struct Player 
+struct Player
 {
     LobbyServer* server;
     unique_ptr<tcp::socket> socket;
     SocketData socketData;
 
     int keepAliveTries = 0;
+    bool hasSentFirstPing = false;
     unique_ptr<asio::steady_timer> keepAliveTimer;
 };
 
@@ -145,8 +146,12 @@ LobbyClient* createLobbyClient(LobbyLibLoop* loop)
     return client;
 }
 
-void deleteLobbyClient(LobbyClient* client) 
+void deleteClient(LobbyClient* client) 
 {
+    // To safely delete a client we must first disconnect it and then process the
+    // remaining event handlers
+    disconnectClient(client);
+    processEvents(client->loop);
     delete client;
 }
 
@@ -171,7 +176,7 @@ void connectToServer(LobbyClient* client, string host, string port)
 
                             // Start the inactivity timer for this socket
                             client->keepAliveTimer = std::make_unique<asio::steady_timer>(
-                                client->loop->io_context, asio::chrono::seconds(client->keepAliveTimeout));
+                                client->loop->io_context, asio::chrono::milliseconds(client->keepAliveTimeout));
                             client->keepAliveTimer->async_wait(std::bind(_clientKeepAliveTimeout, client, _1));
 
                             using sig = void(*)(LobbyClient*, bool, const error_code&, size_t);
@@ -180,12 +185,14 @@ void connectToServer(LobbyClient* client, string host, string port)
                             asio::async_read(*client->socket, asio::buffer(client->socketData.header, HEADER_SIZE), 
                                 std::bind(static_cast<sig>(_asyncReadHandler), client, true, _1, _2));
                         } else {
-                            _connectErrorEvent(client, error2.message(), host, port);
+                            if (error != boost::asio::error::operation_aborted)
+                                _connectErrorEvent(client, error2.message(), host, port);
                         }
                     }
                 );
             } else {
-                _connectErrorEvent(client, error.message(), host, port);
+                if (error != boost::asio::error::operation_aborted)
+                    _connectErrorEvent(client, error.message(), host, port);
             }
         }
     );
@@ -201,8 +208,11 @@ void _connectErrorEvent(LobbyClient* client, string message, string host, string
     client->loop->events.push_back(std::move(event));
 }
 
-void disconnectFromServer(LobbyClient* client) 
+void disconnectClient(LobbyClient* client) 
 {
+    if (client->resolver)
+        client->resolver->cancel();
+
     if (client->socket) {
         error_code error;
         client->socket->shutdown(tcp::socket::shutdown_both, error);
@@ -251,6 +261,16 @@ LobbyServer* createLobbyServer(LobbyLibLoop* loop)
 
 void deleteLobbyServer(LobbyServer* server) 
 {
+    // Clean up the acceptor
+    stopListening(server);
+
+    // Clean up the players
+    for (const unique_ptr<Player> &player : server->players)
+        disconnectPlayer(player.get());
+
+    // Allow handlers to exit
+    processEvents(server->loop);
+
     delete server;
 }
 
@@ -284,11 +304,11 @@ void _asyncAcceptHandler(LobbyServer* server, string port, const error_code& err
         Player* player = player_ptr.get();
         player->server = server;
         player->socket = std::move(socket_ptr);
-        player->keepAliveTimer = std::make_unique<asio::steady_timer>(
-            server->loop->io_context, asio::chrono::seconds(INACTIVITY_TIMEOUT));
         server->players.insert(std::move(player_ptr));
 
-        // Start the inactivity timer for this socket
+        // Start the keep alive timer for this socket and send the first ping
+        player->keepAliveTimer = std::make_unique<asio::steady_timer>(
+            server->loop->io_context, asio::chrono::milliseconds(0));
         player->keepAliveTimer->async_wait(std::bind(_playerKeepAliveTimeout, player, _1));
 
         // Create the AcceptedEvent for this newly accepted connection
@@ -304,16 +324,16 @@ void _asyncAcceptHandler(LobbyServer* server, string port, const error_code& err
         // Start infinitely reading from the socket
         asio::async_read(*socket, asio::buffer(player->socketData.header, HEADER_SIZE), 
             std::bind(static_cast<sig>(_asyncReadHandler), player, true, _1, _2));
+
+        // Restart so we can accept more connections
+        server->acceptor->async_accept(std::bind(_asyncAcceptHandler, server, port, _1, _2));
     } else {
-        if (error == asio::error::operation_aborted) {
-            server->acceptor = nullptr;
-            return;
-        }
-
-        _acceptErrorEvent(server, error.message(), port);
+        if (error != asio::error::operation_aborted)
+            _acceptErrorEvent(server, error.message(), port);
+        
+        // Delete the acceptor
+        server->acceptor = nullptr;
     }
-
-    server->acceptor->async_accept(std::bind(_asyncAcceptHandler, server, port, _1, _2));
 }
 
 void _acceptErrorEvent(LobbyServer* server, string message, string port) 
@@ -360,9 +380,9 @@ void _asyncReadHandler(T* obj, tcp::socket* socket, SocketData* messageData, std
             // Process the message
             _handleMessage(obj);
 
-            // Start reading the head of the next message
+            // Start reading the header of the next message
             asio::async_read(*socket, asio::buffer(messageData->header, HEADER_SIZE), 
-                std::bind(static_cast<sig>(_asyncReadHandler), obj, false, _1, _2));
+                std::bind(static_cast<sig>(_asyncReadHandler), obj, true, _1, _2));
         }
     } else {
         // Deal with EOF or other read errors
@@ -385,6 +405,13 @@ void _handleMessage(LobbyClient* client)
         // Ping!
         case 0: {
             std::cout << "Ping!" << std::endl;
+            // If the client timeout seconds are included in this ping, extract them
+            if (client->socketData.content_size >= 3) {
+                client->keepAliveTimeout = boost::endian::load_big_u16(
+                    reinterpret_cast<unsigned char*>(client->socketData.buffer.get() + 1));
+                std::cout << "New keep alive seconds! Seconds: " << client->keepAliveTimeout << std::endl;
+            }
+            
             client->keepAliveTimer->cancel();
             // Send a "pong" !
             char message[] = {0};
@@ -412,7 +439,7 @@ void _handleMessage(Player* player)
 void _clientDisconnectedEvent(LobbyClient* client) 
 {
     // Cleanup operations
-    disconnectFromServer(client);
+    disconnectClient(client);
     client->keepAliveTimer->cancel();
 
     unique_ptr<ClientDisconnectedEvent> event = std::make_unique<ClientDisconnectedEvent>();
@@ -451,39 +478,51 @@ void _clientKeepAliveTimeout(LobbyClient* client, const error_code& error) {
     if (error == asio::error::operation_aborted) {
         if (client->socket->is_open()) {
             // Operation aborted means we received a "ping" before the timer expired
-            client->keepAliveTimer->expires_after(asio::chrono::seconds(client->keepAliveTimeout));
+            client->keepAliveTimer->expires_after(asio::chrono::milliseconds(client->keepAliveTimeout));
             client->keepAliveTimer->async_wait(std::bind(_clientKeepAliveTimeout, client, _1));
         }
     } else {
         // The server has timed out, disconnect from it
         std::cout << "Client timeout" << std::endl;
-        disconnectFromServer(client);
+        disconnectClient(client);
     }
 }
 
 void _playerKeepAliveTimeout(Player* player, const error_code& error) 
 {
     if (error == asio::error::operation_aborted) {
+        // Operation aborted means we received a "pong" before the timer expired
         if (player->socket->is_open()) {
-            // Operation aborted means we received a "pong" before the timer expired
+            // Only reset the timer if the socket is still open, incase the operation was aborted
+            // due to the sockect bring closed
             player->keepAliveTries = 0;
-            player->keepAliveTimer->expires_after(asio::chrono::seconds(INACTIVITY_TIMEOUT));
+            player->keepAliveTimer->expires_after(asio::chrono::milliseconds(INACTIVITY_TIMEOUT));
             player->keepAliveTimer->async_wait(std::bind(_playerKeepAliveTimeout, player, _1));
         }
     } else {
-        if (player->keepAliveTries < KEEP_ALIVE_TRIES) {
-            player->keepAliveTries++;
-            // Send a "ping" 
-            char message[] = {0};
-            _sendMessage(player, message, 1);
-
-            // Start waiting for a pong
-            player->keepAliveTimer->expires_after(asio::chrono::seconds(REPLY_TIMEOUT));
-            player->keepAliveTimer->async_wait(std::bind(_playerKeepAliveTimeout, player, _1));
-        } else {
+        if (player->keepAliveTries >= KEEP_ALIVE_TRIES) {
             // The player has timed out, disconnect them
             std::cout << "Player timeout" << std::endl;
             disconnectPlayer(player);
+        } else {
+            // Send a "ping" and include the client timeout seconds if this is the first ping
+            size_t messageLength = player->hasSentFirstPing ? 1 : 3;
+            char message[messageLength];
+            message[0] = 0;
+
+            if (!player->hasSentFirstPing) {
+                boost::endian::store_big_u16(reinterpret_cast<unsigned char*>(message + 1), 
+                    INACTIVITY_TIMEOUT + REPLY_TIMEOUT * KEEP_ALIVE_TRIES);
+
+                player->hasSentFirstPing = true;
+            }
+
+            _sendMessage(player, message, messageLength);
+
+            // Increment the counter for tries and start waiting for a pong
+            player->keepAliveTries++;
+            player->keepAliveTimer->expires_after(asio::chrono::milliseconds(REPLY_TIMEOUT));
+            player->keepAliveTimer->async_wait(std::bind(_playerKeepAliveTimeout, player, _1));
         }
     }
 }
@@ -544,7 +583,8 @@ void _asyncWriteHandler(T* obj, tcp::socket* socket, SocketData* data,
                 std::bind(_asyncWriteHandler<T>, obj, socket, data, errorEventHandler, _1, _2));
         }
     } else {
-        errorEventHandler(obj, error.message());
+        if (error != boost::asio::error::operation_aborted)
+            errorEventHandler(obj, error.message());
     }
 }
 
@@ -570,7 +610,6 @@ void stopListening(LobbyServer* server)
         error_code error;
         server->acceptor->cancel(error);
         server->acceptor->close(error);
-        server->acceptor = nullptr;
     }
 }
 
@@ -584,6 +623,12 @@ void disconnectPlayer(Player* player)
 
 void deletePlayer(Player* player) 
 {
+    // To safely delete a player we must first disconnect it and then process the
+    // remaining event handlers
+    disconnectPlayer(player);
+    processEvents(player->server->loop);
+
+    // Remove/delete the player from the server
     std::set<unique_ptr<Player>>::iterator iterator = 
         std::find_if(player->server->players.begin(), player->server->players.end(), 
             [=](const unique_ptr<Player>& ptr) {
