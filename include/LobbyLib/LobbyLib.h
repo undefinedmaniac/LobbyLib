@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include <list>
 
 namespace LL
 {
@@ -14,12 +15,35 @@ struct LobbyServer;
 struct Lobby;
 struct Player;
 
+enum LobbyUpdate : unsigned char {
+    PlayerJoined = 0,
+    PlayerLeft = 1
+};
+
+enum UsernameValidity : unsigned char {
+    Valid = 0, 
+    TooShort = 1, 
+    TooLong = 2, 
+    InvalidCharacters = 3
+};
+
+enum LobbyErrorCode : unsigned char {
+    NoError = 0,
+    DoesNotExist = 1,
+    IsNotOpen = 2,
+    IsFull = 3
+};
+
 enum EventType {
     Connected, ConnectError, 
     Accepted, AcceptError, 
     ClientDisconnected, PlayerDisconnected, 
     ClientReadError, PlayerReadError,
-    ClientWriteError, PlayerWriteError
+    ClientWriteError, PlayerWriteError,
+    ClientJoinedLobby, ClientLobbyUpdated,
+    LobbyCreated, LobbyDestroyed, 
+    PlayerLobbyUpdated,
+    LobbyError, UsernameError
 };
 
 struct Event {
@@ -91,6 +115,59 @@ struct PlayerWriteErrorEvent : public Event {
     std::string error_message;
 };
 
+struct ClientJoinedLobbyEvent : public Event {
+    ClientJoinedLobbyEvent() : Event(ClientJoinedLobby) {}
+    LobbyClient* client;
+    std::string lobbyCode;
+    std::list<std::string> lobbyPlayers;
+};
+
+struct ClientLobbyUpdatedEvent : public Event {
+    ClientLobbyUpdatedEvent() : Event(ClientLobbyUpdated) {}
+    LobbyClient* client;
+    LobbyUpdate updateType;
+    std::string username;
+};
+
+struct LobbyCreatedEvent : public Event {
+    LobbyCreatedEvent() : Event(LobbyCreated) {}
+    Lobby* lobby;
+    std::string code;
+
+    Player* player;
+    std::string username;
+};
+
+struct LobbyDestroyedEvent : public Event {
+    LobbyDestroyedEvent() : Event(LobbyDestroyed) {}
+    Lobby* lobby;
+    std::string code;
+    
+    Player* player;
+    std::string username;
+};
+
+struct PlayerLobbyUpdatedEvent : public Event {
+    PlayerLobbyUpdatedEvent() : Event(PlayerLobbyUpdated) {}
+    Player* player;
+    LobbyUpdate updateType;
+    std::string username;
+};
+
+struct LobbyErrorEvent : public Event {
+    LobbyErrorEvent() : Event(LobbyError) {}
+    LobbyClient* client;
+    LobbyErrorCode error;
+    std::string error_message;
+};
+
+struct UsernameErrorEvent : public Event {
+    UsernameErrorEvent() : Event(UsernameError) {}
+    LobbyClient* client;
+    UsernameValidity validity;
+    std::string error_message;
+};
+
 typedef std::unique_ptr<LobbyLibLoop, void(*)(LobbyLibLoop*)> LoopPtr;
 typedef std::unique_ptr<LobbyServer, void(*)(LobbyServer*)> ServerPtr;
 typedef std::unique_ptr<LobbyClient, void(*)(LobbyClient*)> ClientPtr;
@@ -152,12 +229,12 @@ void connectToServer(LobbyClient* client, std::string host, std::string port);
  */
 void disconnectClient(LobbyClient* client);
 
-// Set username
-void setUsername(LobbyClient* client, std::string username);
+// Check if a username meets the validity requirements
+UsernameValidity checkUsername(std::string username);
 
 // Join/Create lobby
-void joinExistingLobby(LobbyClient* client, std::string lobbyId);
-void createNewLobby(LobbyClient* client);
+void joinExistingLobby(LobbyClient* client, std::string lobbyId, std::string username);
+void createNewLobby(LobbyClient* client, std::string username);
 
 // Send messages
 void sendChatMessage(LobbyClient* client, std::string message);

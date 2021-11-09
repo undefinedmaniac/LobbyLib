@@ -1,12 +1,17 @@
 #include "LobbyLib/LobbyLib.h"
 
-#include <set>
+#include <list>
 #include <deque>
 #include <memory>
-#include <iostream>
+#include <numeric>
+#include <unordered_set>
+#include <unordered_map>
 
 #include <boost/asio.hpp>
 #include <boost/endian/conversion.hpp>
+
+#include <boost/random/mersenne_twister.hpp>
+#include <boost/random/uniform_int_distribution.hpp>
 
 using std::size_t;
 using std::string;
@@ -20,10 +25,23 @@ using namespace std::placeholders;
 namespace LL
 {
 
+// Username constraints
+const unsigned short MAX_USERNAME_LENGTH = 20;
+const unsigned short MIN_USERNAME_CHAR = '!';
+const unsigned short MAX_USERNAME_CHAR = '~';
+
+// Number of digits in the lobby code
+const int CODE_SIZE = 4;
+
+// Size of the network message header
 const unsigned short HEADER_SIZE = 2;
+
+// Keep alive settings
 const unsigned short INACTIVITY_TIMEOUT = 5000;
 const unsigned short REPLY_TIMEOUT = 1000;
 const unsigned short KEEP_ALIVE_TRIES = 3;
+
+std::unique_ptr<boost::random::mt11213b> RANDOM_GENERATOR;
 
 struct SocketData;
 
@@ -39,8 +57,13 @@ void _asyncReadHandler(T* obj, tcp::socket* socket, SocketData* messageData,
     std::function<void(T*)> disconnectHandler, std::function<void(T*, string)> readErrorHandler,
     bool readHeader, const error_code& error);
 
+bool _hasEnoughContent(const SocketData& data, unsigned short required_size);
 void _handleMessage(LobbyClient* client);
+void _notifyInvalidUsername(Player* player, UsernameValidity validity);
 void _handleMessage(Player* player);
+
+UsernameValidity _isUsernameValid(const char* username, unsigned short length);
+std::string _generateLobbyCode(int length = CODE_SIZE);
 
 void _clientDisconnectedEvent(LobbyClient* client);
 void _playerDisconnectedEvent(Player* player);
@@ -51,11 +74,13 @@ void _playerReadErrorEvent(Player* player, string message);
 void _clientKeepAliveTimeout(LobbyClient* client, const error_code& error);
 void _playerKeepAliveTimeout(Player* player, const error_code& error);
 
-void _sendMessage(LobbyClient* client, char message[], size_t messageLength);
-void _sendMessage(Player* player, char message[], size_t messageLength);
+void _sendMessage(LobbyClient* client, const char* message, const size_t messageLength);
+void _sendMessage(LobbyClient* client, const char** messageParts, const size_t* messageLengths, int numberOfParts);
+void _sendMessage(Player* player, const char* message, const size_t messageLength);
+void _sendMessage(Player* player, const char** messageParts, const size_t* messageLengths, int numberOfParts);
 template <typename T>
-void _sendMessage(T* obj, tcp::socket* socket, SocketData* data, 
-    std::function<void(T*, string)> errorEventHandler, char message[], size_t messageLength);
+void _sendMessage(T* obj, tcp::socket* socket, SocketData* data,
+    std::function<void(T*, string)> errorEventHandler, const char** messageParts, const size_t* partLengths, int numberOfParts);
 template <typename T>
 void _asyncWriteHandler(T* obj, tcp::socket* socket, SocketData* data, 
     std::function<void(T*, string)> errorEventHandler, const error_code& error, size_t bytes_transferred);
@@ -84,23 +109,21 @@ struct LobbyClient
     unique_ptr<tcp::resolver> resolver;
     unique_ptr<tcp::socket> socket;
     SocketData socketData;
+    std::list<string> lobbyPlayers;
 
     unsigned short keepAliveTimeout = INACTIVITY_TIMEOUT + REPLY_TIMEOUT * KEEP_ALIVE_TRIES;
     unique_ptr<asio::steady_timer> keepAliveTimer;
 };
 
-struct LobbyServer 
+struct Lobby
 {
-    LobbyLibLoop* loop;
-    unique_ptr<tcp::acceptor> acceptor;
-    std::set<unique_ptr<Player>> players;
-};
-struct Lobby 
-{
-
+    string code;
+    std::list<Player*> players;
 };
 struct Player
 {
+    Lobby* lobby = nullptr;
+    string username;
     LobbyServer* server;
     unique_ptr<tcp::socket> socket;
     SocketData socketData;
@@ -108,6 +131,27 @@ struct Player
     int keepAliveTries = 0;
     bool hasSentFirstPing = false;
     unique_ptr<asio::steady_timer> keepAliveTimer;
+};
+struct LobbyServer 
+{
+    LobbyLibLoop* loop;
+    unique_ptr<tcp::acceptor> acceptor;
+    std::unordered_set<unique_ptr<Player>> players;
+    std::unordered_map<string, unique_ptr<Lobby>> lobbies;
+};
+
+enum ClientMessages : unsigned char {
+    PING = 0,
+    JOINED_LOBBY = 1,
+    LOBBY_UPDATED = 2,
+    LOBBY_ERROR = 3,
+    USERNAME_ERROR = 4,
+};
+
+enum PlayerMessages : unsigned char {
+    PONG = 0,
+    CREATE_LOBBY = 1,
+    JOIN_EXISTING_LOBBY = 2
 };
 
 LobbyLibLoop* createLoop() 
@@ -138,7 +182,7 @@ Event* getNextEvent(LobbyLibLoop* loop)
     return event;
 }
 
-// Create/Delete a lobby client
+// Create a lobby client
 LobbyClient* createLobbyClient(LobbyLibLoop* loop) 
 {
     LobbyClient* client = new LobbyClient();
@@ -146,6 +190,7 @@ LobbyClient* createLobbyClient(LobbyLibLoop* loop)
     return client;
 }
 
+// Delete a lobby client
 void deleteClient(LobbyClient* client) 
 {
     // To safely delete a client we must first disconnect it and then process the
@@ -222,21 +267,29 @@ void disconnectClient(LobbyClient* client)
 
 
 // Set username
-void setUsername(LobbyClient* client, string username) 
+UsernameValidity checkUsername(string username) 
 {
-
+    return _isUsernameValid(username.c_str(), username.length());
 }
 
 
 // Join/Create lobby
-void joinExistingLobby(LobbyClient* client, string lobbyId) 
+void joinExistingLobby(LobbyClient* client, string lobbyId, string username) 
 {
-
+    // Send the server a message asking to join an existing lobby and giving our username
+    size_t messageLengths[] = {1, lobbyId.size() + 1, username.size() + 1};
+    const char part1[] = {PlayerMessages::JOIN_EXISTING_LOBBY};
+    const char* messageParts[] = {part1, lobbyId.c_str(), username.c_str()};
+    _sendMessage(client, messageParts, messageLengths, 3);
 }
 
-void createNewLobby(LobbyClient* client) 
+void createNewLobby(LobbyClient* client, string username) 
 {
-
+    // Send the server a message asking to make a new lobby and giving our username
+    size_t messageLengths[] = {1, username.length()};
+    const char part1[] = {PlayerMessages::CREATE_LOBBY};
+    const char* messageParts[] = {part1, username.c_str()};
+    _sendMessage(client, messageParts, messageLengths, 2);
 }
 
 
@@ -396,44 +449,343 @@ void _asyncReadHandler(T* obj, tcp::socket* socket, SocketData* messageData, std
     }
 }
 
+bool _hasEnoughContent(const SocketData& data, unsigned short required_size)
+{
+    return data.content_size >= required_size;
+}
+
 void _handleMessage(LobbyClient* client) 
 {
+    SocketData& socketData = client->socketData;
+
     // The first byte of the message indicates what type of message it is
-    uint8_t messageType = client->socketData.buffer[0];
+    uint8_t messageType = socketData.buffer[0];
 
     switch (messageType) {
         // Ping!
-        case 0: {
-            std::cout << "Ping!" << std::endl;
+        case ClientMessages::PING: {
             // If the client timeout seconds are included in this ping, extract them
-            if (client->socketData.content_size >= 3) {
+            if (_hasEnoughContent(socketData, 3)) {
                 client->keepAliveTimeout = boost::endian::load_big_u16(
-                    reinterpret_cast<unsigned char*>(client->socketData.buffer.get() + 1));
-                std::cout << "New keep alive seconds! Seconds: " << client->keepAliveTimeout << std::endl;
+                    reinterpret_cast<unsigned char*>(socketData.buffer.get() + 1));
             }
             
             client->keepAliveTimer->cancel();
             // Send a "pong" !
-            char message[] = {0};
+            char message[] = {PlayerMessages::PONG};
             _sendMessage(client, message, 1);
+            break;
+        }
+        // Joined lobby
+        case ClientMessages::JOINED_LOBBY: {
+            // Check if there is enough data for the lobby code and the last character in the content is a null terminator
+            if (!_hasEnoughContent(socketData, 2) && socketData.buffer[socketData.content_size - 1] == '\0')
+                return;
+
+            // Extract the lobby code itself
+            string code = string(socketData.buffer.get() + 1);
+
+            // Get the list of players currently in the lobby
+            std::list<string> playerList;
+
+            // If there is at least one string in the username list
+            if (_hasEnoughContent(socketData, 1 + code.size() + 2)) 
+            {
+                char* iterator = socketData.buffer.get() + 1 + code.size() + 1;
+                while (iterator < socketData.buffer.get() + socketData.content_size) {
+                    playerList.push_back(string(iterator));
+                    iterator += playerList.back().size() + 1;
+                }
+            }
+
+            // Create a lobby joined event
+            unique_ptr<ClientJoinedLobbyEvent> event = std::make_unique<ClientJoinedLobbyEvent>();
+            event->client = client;
+            event->lobbyCode = code;
+            event->lobbyPlayers = playerList;
+            client->loop->events.push_back(std::move(event));
+
+            // Move the list into the client
+            client->lobbyPlayers = std::move(playerList);
+            break;
+        }
+        // Lobby updated (a player joined/left)
+        case ClientMessages::LOBBY_UPDATED: {
+            if (!_hasEnoughContent(socketData, 2))
+                return;
+
+            // Get the update type
+            LobbyUpdate updateType = static_cast<LobbyUpdate>(reinterpret_cast<unsigned char&>(socketData.buffer[1]));
+
+            // A player has joined or left the lobby
+            if (updateType == LobbyUpdate::PlayerJoined || updateType == LobbyUpdate::PlayerLeft) {
+                if (!_hasEnoughContent(socketData, 3))
+                    return;
+
+                // Extract the player's username
+                string username = string(socketData.buffer.get() + 2, socketData.buffer_size - 2);
+
+                if (updateType == LobbyUpdate::PlayerJoined) {
+                    // Add the player to this client's lobby player list
+                    client->lobbyPlayers.push_back(username);
+                } else {
+                    // Remove the player from this client's lobby player list
+                    auto iterator = std::find(client->lobbyPlayers.begin(), client->lobbyPlayers.end(), username);
+                    if (iterator != client->lobbyPlayers.end())
+                        client->lobbyPlayers.erase(iterator);
+                }
+
+                // Create the lobby update event
+                unique_ptr<ClientLobbyUpdatedEvent> event = std::make_unique<ClientLobbyUpdatedEvent>();
+                event->client = client;
+                event->updateType = updateType;
+                event->username = username;
+                client->loop->events.push_back(std::move(event));
+            }
+            break;
+        }
+        // Lobby error
+        case ClientMessages::LOBBY_ERROR: {
+            if (!_hasEnoughContent(socketData, 2))
+                return;
+
+            // Extract the error code and error message and create an event
+            unique_ptr<LobbyErrorEvent> event = std::make_unique<LobbyErrorEvent>();
+            event->client = client;
+            event->error = static_cast<LobbyErrorCode>(reinterpret_cast<unsigned char&>(socketData.buffer[1]));;
+            event->error_message = string(socketData.buffer.get() + 2, socketData.content_size - 2);
+            client->loop->events.push_back(std::move(event));
+            break;
+        }
+        // Username error
+        case ClientMessages::USERNAME_ERROR: {
+            if (!_hasEnoughContent(socketData, 2))
+                return;
+
+            // Extract the error code and error message and create an event
+            unique_ptr<UsernameErrorEvent> event = std::make_unique<UsernameErrorEvent>();
+            event->client = client;
+            event->validity = static_cast<UsernameValidity>(reinterpret_cast<unsigned char&>(socketData.buffer[1]));;
+            event->error_message = string(socketData.buffer.get() + 2, socketData.content_size - 2);
+            client->loop->events.push_back(std::move(event));
             break;
         }
     }
 }
 
-void _handleMessage(Player* player) 
+void _notifyInvalidUsername(Player* player, UsernameValidity validity)
 {
+    // Invalid username, notify the client
+    string errorMessage;
+    switch (validity) {
+        case TooShort:
+            errorMessage = "The given username is too short";
+            break;
+        case TooLong:
+            errorMessage = "The given username is too long";
+            break;
+        case InvalidCharacters:
+            errorMessage = "The given username contains invalid characters";
+            break;
+    }
+
+    size_t messageLengths[] = {1, 1, errorMessage.length()};
+    const char part1[] = {ClientMessages::USERNAME_ERROR};
+    const char part2[] = {reinterpret_cast<char&>(validity)};
+    const char* messageParts[] = {part1, part2, errorMessage.c_str()};
+    _sendMessage(player, messageParts, messageLengths, 3);
+}
+
+void _handleMessage(Player* player)
+{
+    SocketData& socketData = player->socketData;
+
     // The first byte of the message indicates what type of message it is
-    uint8_t messageType = player->socketData.buffer[0];
+    uint8_t messageType = socketData.buffer[0];
 
     switch (messageType) {
         // Pong!
-        case 0: {
-            std::cout << "Pong!" << std::endl;
+        case PlayerMessages::PONG: {
             player->keepAliveTimer->cancel();
             break;
         }
+        // Create new lobby
+        case PlayerMessages::CREATE_LOBBY: {
+            // Ignore this message if the player already has a lobby
+            if (player->lobby != nullptr)
+                return;
+
+            // Check if the proposed username is valid
+            char* username = socketData.buffer.get() + 1;
+            unsigned short usernameLength = socketData.content_size - 1;
+            UsernameValidity validity = _isUsernameValid(username, usernameLength);
+
+            if (validity == UsernameValidity::Valid) {
+                // Convert the username into a proper string
+                player->username = string(username, usernameLength);
+
+                // Find a lobby code that is not already in use
+                string lobbyCode;
+                do {
+                    lobbyCode = _generateLobbyCode();
+                } while (player->server->lobbies.find(lobbyCode) != player->server->lobbies.end());
+
+                // Create a new lobby with the new code
+                unique_ptr<Lobby> lobby = std::make_unique<Lobby>();
+                lobby->code = lobbyCode;
+
+                // Assign the player to the lobby and put the lobby in the server
+                player->lobby = lobby.get();
+                lobby->players.push_back(player);
+                player->server->lobbies.insert(std::make_pair(lobbyCode, std::move(lobby)));
+
+                // Create the new lobby event
+                unique_ptr<LobbyCreatedEvent> event = std::make_unique<LobbyCreatedEvent>();
+                event->lobby = lobby.get();
+                event->code = lobbyCode;
+                event->player = player;
+                event->username = player->username;
+                player->server->loop->events.push_back(std::move(event));
+
+                // Let the client know that the lobby has been created
+                size_t messageLengths[] = {1, lobbyCode.length() + 1};
+                const char part1[] = {ClientMessages::JOINED_LOBBY};
+                const char* messageParts[] = {part1, lobbyCode.c_str()};
+                _sendMessage(player, messageParts, messageLengths, 2);
+            } else {
+                _notifyInvalidUsername(player, validity);
+            }
+            break;
+        }
+        // Join an existing lobby
+        case JOIN_EXISTING_LOBBY: {
+            // Make sure there is enough data for the lobby code and 
+            // the last character in the content is a null terminator and
+            // the player does not already have a lobby
+            if (!_hasEnoughContent(socketData, 2) || 
+                socketData.buffer[socketData.content_size - 1] != '\0' ||
+                player->lobby != nullptr)
+                return;
+
+            // Get the code for the requested lobby
+            string code = string(socketData.buffer.get() + 1);
+
+            Lobby* lobby;
+            LobbyErrorCode error;
+
+            // Search for the lobby with the specified code
+            auto iterator = player->server->lobbies.find(code);
+            if (iterator != player->server->lobbies.end()) {
+                lobby = iterator->second.get();
+                error = LobbyErrorCode::NoError;
+            } else {
+                lobby = nullptr;
+                error = LobbyErrorCode::DoesNotExist;
+            }
+
+            if (error == LobbyErrorCode::NoError) {
+                // Check if the proposed username is valid
+                string username = string(socketData.buffer.get() + 1 + code.size() + 1);
+                UsernameValidity validity = _isUsernameValid(username.c_str(), username.size());
+
+                if (validity == UsernameValidity::Valid) {
+                    // Assign the player's username
+                    player->username = username;
+
+                    // Notify the client that they are now in the lobby
+                    int numberOfPlayers = lobby->players.size();
+
+                    size_t messageLengths[2 + numberOfPlayers] = {1, code.length() + 1};
+                    const char part1[] = {ClientMessages::JOINED_LOBBY};
+                    const char* messageParts[2 + numberOfPlayers] = {part1, code.c_str()};
+                    
+                    int i = 2;
+                    for (Player* lobbyPlayer : lobby->players) {
+                        messageLengths[i] = lobbyPlayer->username.size() + 1;
+                        messageParts[i] = lobbyPlayer->username.c_str();
+                        i++;
+                    }
+
+                    _sendMessage(player, messageParts, messageLengths, 2 + numberOfPlayers);
+
+                    // Notify all other clients that there is a new lobby member
+                    size_t messageLengths2[] = {1, 1, username.size()};
+                    const char part1_2[] = {ClientMessages::LOBBY_UPDATED};
+                    const char part2_2[] = {LobbyUpdate::PlayerJoined};
+                    const char* messageParts2[] = {part1_2, part2_2, username.c_str()};
+                    for (Player* lobbyPlayer : lobby->players)
+                        _sendMessage(lobbyPlayer, messageParts, messageLengths, 3);
+                    
+                    // Place the player in the lobby
+                    player->lobby = lobby;
+                    lobby->players.push_back(player);
+
+                    // Create a lobby update event
+                    unique_ptr<PlayerLobbyUpdatedEvent> event = std::make_unique<PlayerLobbyUpdatedEvent>();
+                    event->player = player;
+                    event->updateType = LobbyUpdate::PlayerJoined;
+                    event->username = player->username;
+                    player->server->loop->events.push_back(std::move(event));
+                } else {
+                    _notifyInvalidUsername(player, validity);
+                }
+            } else {
+                // Lobby error, notify the client
+                string errorMessage;
+                switch (error) {
+                    case DoesNotExist:
+                        errorMessage = "The specified lobby does not exist";
+                        break;
+                    case IsNotOpen:
+                        errorMessage = "The specified lobby is not open";
+                        break;
+                    case IsFull:
+                        errorMessage = "The specified lobby is already full";
+                        break;
+                }
+
+                size_t messageLengths[] = {1, 1, errorMessage.length()};
+                const char part1[] = {ClientMessages::LOBBY_ERROR};
+                const char part2[] = {reinterpret_cast<char&>(error)};
+                const char* messageParts[] = {part1, part2, errorMessage.c_str()};
+                _sendMessage(player, messageParts, messageLengths, 3);
+            }
+            break;
+        }
     }
+}
+
+// Check if a username is valid by checking it's length and the range of allowed characters
+UsernameValidity _isUsernameValid(const char* username, unsigned short length) {
+    if (length == 0)
+        return TooShort;
+    else if (length > MAX_USERNAME_LENGTH)
+        return TooLong;
+
+    for (int i = 0; i < length; i++) {
+        char character = *(username + i);
+        if (character < MIN_USERNAME_CHAR || character > MAX_USERNAME_CHAR)
+            return InvalidCharacters;
+    }
+
+    return Valid;
+}
+
+std::string _generateLobbyCode(int length) 
+{
+    if (!RANDOM_GENERATOR)
+        RANDOM_GENERATOR = std::make_unique<boost::random::mt11213b>(std::time(0));
+
+    boost::random::uniform_int_distribution<> distribution(0, 35);
+
+    char code[length];
+
+    for (int i = 0; i < length; i++) {
+        int value = distribution(*RANDOM_GENERATOR);
+        code[i] = value + (value < 26 ? 'A' : '0' - 26);
+    }
+
+    return std::string(code, length);
 }
 
 void _clientDisconnectedEvent(LobbyClient* client) 
@@ -449,10 +801,49 @@ void _clientDisconnectedEvent(LobbyClient* client)
 
 void _playerDisconnectedEvent(Player* player) 
 {
+    // Remove the player from their associated lobby, if necessary
+    if (player->lobby != nullptr) {
+        // Remove the player from the lobby
+        auto iterator = std::find(player->lobby->players.begin(), player->lobby->players.end(), player);
+        if (iterator != player->lobby->players.end())
+            player->lobby->players.erase(iterator);
+
+        if (player->lobby->players.empty()) {
+            // Create a lobby destroyed event
+            unique_ptr<LobbyDestroyedEvent> event = std::make_unique<LobbyDestroyedEvent>();
+            event->lobby = player->lobby;
+            event->code = player->lobby->code;
+            event->player = player;
+            event->username = player->username;
+
+            // Delete the lobby if it is empty
+            auto iterator2 = player->server->lobbies.find(player->lobby->code);
+            if (iterator2 != player->server->lobbies.end())
+                player->server->lobbies.erase(iterator2);
+
+            player->server->loop->events.push_back(std::move(event));
+        } else {
+            // Notify other players that someone has left their lobby
+            size_t messageLengths[] = {1, 1, player->username.size()};
+            const char part1[] = {ClientMessages::LOBBY_UPDATED};
+            const char part2[] = {LobbyUpdate::PlayerLeft};
+            const char* messageParts[] = {part1, part2, player->username.c_str()};
+            for (Player* lobbyPlayer : player->lobby->players)
+                _sendMessage(lobbyPlayer, messageParts, messageLengths, 3);
+
+            // Create a lobby updated event
+            unique_ptr<PlayerLobbyUpdatedEvent> event = std::make_unique<PlayerLobbyUpdatedEvent>();
+            event->player = player;
+            event->updateType = LobbyUpdate::PlayerLeft;
+            event->username = player->username;
+            player->server->loop->events.push_back(std::move(event));
+        }
+    }
+
     // Cleanup operations
     disconnectPlayer(player);
     player->keepAliveTimer->cancel();
-    
+
     unique_ptr<PlayerDisconnectedEvent> event = std::make_unique<PlayerDisconnectedEvent>();
     event->player = player;
     player->server->loop->events.push_back(std::move(event));
@@ -483,7 +874,6 @@ void _clientKeepAliveTimeout(LobbyClient* client, const error_code& error) {
         }
     } else {
         // The server has timed out, disconnect from it
-        std::cout << "Client timeout" << std::endl;
         disconnectClient(client);
     }
 }
@@ -502,13 +892,12 @@ void _playerKeepAliveTimeout(Player* player, const error_code& error)
     } else {
         if (player->keepAliveTries >= KEEP_ALIVE_TRIES) {
             // The player has timed out, disconnect them
-            std::cout << "Player timeout" << std::endl;
             disconnectPlayer(player);
         } else {
             // Send a "ping" and include the client timeout seconds if this is the first ping
             size_t messageLength = player->hasSentFirstPing ? 1 : 3;
             char message[messageLength];
-            message[0] = 0;
+            message[0] = ClientMessages::PING;
 
             if (!player->hasSentFirstPing) {
                 boost::endian::store_big_u16(reinterpret_cast<unsigned char*>(message + 1), 
@@ -527,31 +916,50 @@ void _playerKeepAliveTimeout(Player* player, const error_code& error)
     }
 }
 
-void _sendMessage(LobbyClient* client, char message[], size_t messageLength)
+void _sendMessage(LobbyClient* client, const char* message, const size_t messageLength)
 {
-    _sendMessage<LobbyClient>(client, client->socket.get(), &client->socketData, 
-        _clientWriteErrorEvent, message, messageLength);
+    const char* messageParts[] = {message};
+    size_t messageLengths[] = {messageLength};
+    _sendMessage(client, messageParts, messageLengths, 1);
 }
 
-void _sendMessage(Player* player, char message[], size_t messageLength)
+void _sendMessage(LobbyClient* client, const char** messageParts, const size_t* messageLengths, int numberOfParts)
+{
+    _sendMessage<LobbyClient>(client, client->socket.get(), &client->socketData, 
+        _clientWriteErrorEvent, messageParts, messageLengths, numberOfParts);
+}
+
+void _sendMessage(Player* player, const char* message, const size_t messageLength)
+{
+    const char* messageParts[] = {message};
+    size_t messageLengths[] = {messageLength};
+    _sendMessage(player, messageParts, messageLengths, 1);
+}
+
+void _sendMessage(Player* player, const char** messageParts, const size_t* messageLengths, int numberOfParts)
 {
     _sendMessage<Player>(player, player->socket.get(), &player->socketData, 
-        _playerWriteErrorEvent, message, messageLength);
+        _playerWriteErrorEvent, messageParts, messageLengths, numberOfParts);
 }
 
 template <typename T>
-void _sendMessage(T* obj, tcp::socket* socket, SocketData* data, 
-    std::function<void(T*, string)> errorEventHandler, char message[], size_t messageLength)
+void _sendMessage(T* obj, tcp::socket* socket, SocketData* data,
+    std::function<void(T*, string)> errorEventHandler, const char** messageParts, const size_t* partLengths, int numberOfParts)
 {
     // The socket is not currently sending data if there are no buffers in the queue
     bool socketIsIdle = data->outgoingBuffers.empty();
 
     // Create a new buffer on the heap to store this message while it's being sent
     // Also we add 2 bytes since a message header will be added at the beginning
-    size_t finalMessageLength = messageLength + 2;
+    size_t messageLength = std::accumulate(partLengths, partLengths + numberOfParts, 0);
+    size_t finalMessageLength = 2 + messageLength;
     unique_ptr<char[]> heapBuffer = std::make_unique<char[]>(finalMessageLength);
     boost::endian::store_big_u16(reinterpret_cast<unsigned char*>(heapBuffer.get()), messageLength);
-    std::copy(message, message + messageLength, heapBuffer.get() + 2);
+
+    // Copy all the parts of the message into the big buffer
+    char* iterator = heapBuffer.get() + 2;
+    for (int i = 0; i < numberOfParts; i++)
+        iterator = std::copy(messageParts[i], messageParts[i] + partLengths[i], iterator);
 
     // Create a boost wrapper for the buffer
     asio::mutable_buffer buffer = asio::buffer(heapBuffer.get(), finalMessageLength);
@@ -629,7 +1037,7 @@ void deletePlayer(Player* player)
     processEvents(player->server->loop);
 
     // Remove/delete the player from the server
-    std::set<unique_ptr<Player>>::iterator iterator = 
+    std::unordered_set<unique_ptr<Player>>::iterator iterator = 
         std::find_if(player->server->players.begin(), player->server->players.end(), 
             [=](const unique_ptr<Player>& ptr) {
                 return ptr.get() == player;

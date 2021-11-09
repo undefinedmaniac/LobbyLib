@@ -1,3 +1,3 @@
-add_executable(lobby_server lobby_server.cpp)
+add_executable(chat_server chat_server.cpp)
 
-target_link_libraries(lobby_server PRIVATE lobby_lib)
+target_link_libraries(chat_server PRIVATE lobby_lib)
